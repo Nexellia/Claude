@@ -1,0 +1,212 @@
+// Biarritz – Détection
+// Stratégie de Christophe (InvestirZen) traduite en règles chiffrées.
+// Seuils marqués [P] dans le document « Stratégie Biarritz — règles complètes » : à valider sur votre model book.
+// Usage : graphique daily, Pine Screener sur une liste de surveillance, alertes.
+// Pédagogique, pas un conseil en investissement.
+
+//@version=5
+indicator("Biarritz – Détection", shorttitle="Biarritz", overlay=true, max_bars_back=300, max_labels_count=200)
+
+// ═════════════ Réglages ═════════════
+grpBB = "Bollinger et moyennes"
+bbLen   = input.int(50, "Bollinger : longueur", minval=10, group=grpBB)
+bbMult  = input.float(1.0, "Bollinger : écart-type", step=0.1, group=grpBB)
+longLen = input.int(200, "Moyenne longue (phase)", minval=50, group=grpBB)
+
+grpMk = "Météo de marché"
+useMkt = input.bool(true, "Filtrer avec l'indice", group=grpMk)
+mktSym = input.symbol("EURONEXT:PX1", "Indice de référence", group=grpMk)
+
+grpPh = "Phase et bases"
+phWin   = input.int(20, "Pente MM200 : nombre de séances", group=grpPh)
+phFlat  = input.float(1.0, "Pente plate : ± %", step=0.1, group=grpPh)
+maxBase = input.int(2, "Base maximum autorisée pour entrer", minval=1, group=grpPh)
+
+grpRest = "Élastique au repos"
+restWin  = input.int(20, "Fenêtre (séances)", group=grpRest)
+restMin  = input.int(14, "Clôtures minimum dans les bandes", group=grpRest)
+slopeWin = input.int(10, "Pente MM50 : nombre de séances", group=grpRest)
+slopeMax = input.float(1.5, "Pente MM50 maximum (%)", step=0.1, group=grpRest)
+nearRes  = input.float(2.0, "Résistance à moins de (ATR)", step=0.1, group=grpRest)
+
+grpRes = "Résistance"
+resLook  = input.int(60, "Profondeur (séances)", minval=10, maxval=250, group=grpRes)
+resSkip  = input.int(3, "Séances récentes exclues", minval=1, group=grpRes)
+minTouch = input.int(2, "Contacts minimum", minval=1, group=grpRes)
+touchTol = input.float(0.25, "Tolérance d'un contact (ATR)", step=0.05, group=grpRes)
+
+grpGift = "Bougie cadeau"
+giftK      = input.float(0.6, "Amplitude maximum vs moyenne", step=0.05, group=grpGift)
+giftN      = input.int(15, "Moyenne d'amplitude sur (séances)", group=grpGift)
+giftNear   = input.float(1.0, "Sous la résistance à moins de (ATR)", step=0.1, group=grpGift)
+momLb      = input.int(5, "Dynamique : clôture > clôture d'il y a (séances)", group=grpGift)
+maxStretch = input.float(6.0, "Écart maximum à la MM50 (%)", step=0.5, group=grpGift)
+maxStop    = input.float(4.0, "Stop maximum (%)", step=0.5, group=grpGift)
+needLowVol = input.bool(false, "Exiger un volume sous sa moyenne 20", group=grpGift)
+validBars  = input.int(3, "Validité de l'ordre (séances)", minval=1, group=grpGift)
+
+grpE = "Résultats"
+useEarn  = input.bool(true, "Exclure si résultats proches", group=grpE)
+earnDays = input.int(7, "Jours calendaires avant publication", group=grpE)
+
+grpRisk = "Taille de position"
+capital = input.float(10000, "Capital", minval=0, group=grpRisk)
+riskPct = input.float(0.5, "Risque par trade (%)", step=0.05, group=grpRisk)
+
+grpVis = "Affichage"
+showTable = input.bool(true, "Afficher la checklist", group=grpVis)
+showRest  = input.bool(true, "Colorer l'élastique au repos", group=grpVis)
+
+// ═════════════ Indicateurs ═════════════
+basis  = ta.sma(close, bbLen)
+dev    = bbMult * ta.stdev(close, bbLen)
+upper  = basis + dev
+lower  = basis - dev
+mmLong = ta.sma(close, longLen)
+atr    = ta.atr(14)
+
+// ═════════════ 1. Météo de marché ═════════════
+// 2 = porteur, 1 = neutre (risque divisé par 2), 0 = défavorable
+[m5, m10, m20] = request.security(mktSym, "D", [ta.sma(close, 5), ta.sma(close, 10), ta.sma(close, 20)], lookahead=barmerge.lookahead_off)
+mktState = not useMkt or na(m20) ? 2 : m10 > m20 and m5 > m10 ? 2 : m10 > m20 ? 1 : 0
+
+// ═════════════ 2. Phase (MM200) ═════════════
+slopeL  = (mmLong / mmLong[phWin] - 1) * 100
+phaseOK = close > mmLong and slopeL >= -phFlat
+
+// ═════════════ 3. Résistance ═════════════
+res = ta.highest(high, resLook)[resSkip]
+touches = 0
+for i = resSkip + 1 to resSkip + resLook - 2
+    if high[i] >= res - touchTol * atr and high[i] >= high[i - 1] and high[i] >= high[i + 1]
+        touches += 1
+resOK = touches >= minTouch
+
+// ═════════════ 4. Numéro de base (approximation) ═════════════
+// Remis à 0 quand la phase est perdue, +1 à chaque clôture au-dessus de la résistance.
+breakout = ta.crossover(close, res)
+var int baseNum = 0
+if close < mmLong or slopeL < -phFlat
+    baseNum := 0
+else if breakout
+    baseNum += 1
+nextBase = baseNum + 1
+baseOK   = nextBase <= maxBase
+
+// ═════════════ 5. Élastique au repos ═════════════
+inside   = close <= upper and close >= lower ? 1 : 0
+slope50  = (basis / basis[slopeWin] - 1) * 100
+restCore = math.sum(inside, restWin) >= restMin and math.abs(slope50) <= slopeMax
+aboveMM  = close > basis
+resNear  = res > close and res - close <= nearRes * atr
+rest     = restCore and aboveMM and resNear
+
+// ═════════════ 6. Bougie cadeau ═════════════
+rng      = high - low
+avgRng   = ta.sma(rng, giftN)[1]
+stretch  = (close / basis - 1) * 100
+lowVol   = volume <= ta.sma(volume, 20)
+giftSize = rng <= giftK * avgRng
+giftPos  = high < res and res - high <= giftNear * atr
+giftMom  = close > close[momLb] and close >= basis
+giftRisk = rng / high * 100 <= maxStop
+gift     = giftSize and giftPos and giftMom and stretch <= maxStretch and giftRisk and (not needLowVol or lowVol)
+
+// ═════════════ 7. Résultats ═════════════
+nextEarn = earnings.future_time
+earnSoon = useEarn and not na(nextEarn) and nextEarn > time and nextEarn - time <= earnDays * 86400000
+
+// ═════════════ 8. Setup, ordre et déclenchement ═════════════
+setup = gift and rest[1] and phaseOK and resOK and baseOK and mktState >= 1 and not earnSoon
+
+riskMult = mktState == 2 ? 1.0 : 0.5
+riskAmt  = capital * riskPct / 100 * riskMult
+
+var float trigLvl  = na
+var float stopLvl  = na
+var int   setupBar = na
+triggered = false
+float entryPx = na
+float entrySl = na
+
+// Ordre en cours : déclenché, expiré ou invalidé
+if not na(setupBar) and bar_index > setupBar
+    if high >= trigLvl and bar_index <= setupBar + validBars
+        triggered := true
+        entryPx := math.max(trigLvl, open)
+        entrySl := stopLvl
+    if triggered or bar_index >= setupBar + validBars or close < stopLvl
+        trigLvl  := na
+        stopLvl  := na
+        setupBar := na
+
+// Nouveau setup : niveaux de l'ordre du lendemain
+if setup
+    trigLvl  := high + syminfo.mintick
+    stopLvl  := low - syminfo.mintick
+    setupBar := bar_index
+
+qty = not na(trigLvl) and trigLvl > stopLvl ? math.floor(riskAmt / (trigLvl - stopLvl)) : na
+
+// Statut : 0 rien · 1 repos · 2 repos + résistance valide · 3 bougie cadeau · 4 ordre déclenché
+statut = not phaseOK ? 0 : triggered ? 4 : setup ? 3 : rest and resOK ? 2 : restCore and aboveMM ? 1 : 0
+
+// ═════════════ Tracés sur le graphique ═════════════
+pU = plot(upper, "Bande haute", color.new(color.teal, 40))
+pL = plot(lower, "Bande basse", color.new(color.teal, 40))
+fill(pU, pL, color.new(color.teal, 88), "Bandes 50/1")
+plot(basis, "MM50", color.teal, 2)
+plot(mmLong, "MM200", color.gray, 2)
+plot(res, "Résistance", resOK ? color.orange : color.new(color.orange, 70), 1, plot.style_stepline)
+plot(trigLvl, "Seuil d'achat", color.orange, 2, plot.style_linebr)
+plot(stopLvl, "Stop", color.red, 2, plot.style_linebr)
+
+bgcolor(showRest and rest and resOK and phaseOK ? color.new(color.teal, 92) : na, title="Élastique au repos")
+plotshape(setup, "Bougie cadeau", shape.triangleup, location.belowbar, color.orange, size=size.small)
+plotshape(triggered, "Entrée", shape.labelup, location.belowbar, color.green, text="Achat", textcolor=color.white, size=size.tiny)
+
+if setup
+    label.new(bar_index, low, "Bougie cadeau · base " + str.tostring(nextBase) + "\nAchat > " + str.tostring(trigLvl, format.mintick) + "\nStop < " + str.tostring(stopLvl, format.mintick) + "\nQuantité " + str.tostring(qty) + (mktState == 1 ? " (risque /2)" : ""), style=label.style_label_up, color=color.new(color.orange, 15), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+
+// ═════════════ Checklist (dernière barre) ═════════════
+var table tb = table.new(position.top_right, 2, 9, border_width=1)
+cell(r, name, ok, val) =>
+    table.cell(tb, 0, r, name, text_color=color.white, bgcolor=color.new(color.gray, 20), text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, r, val, text_color=color.white, bgcolor=ok ? color.new(color.green, 30) : color.new(color.red, 30), text_size=size.small)
+
+if showTable and barstate.islast
+    cell(0, "Météo indice", mktState >= 1, mktState == 2 ? "Porteur" : mktState == 1 ? "Neutre" : "Défavorable")
+    cell(1, "Phase MM200", phaseOK, str.tostring(slopeL, "#.#") + " %")
+    cell(2, "Base visée", baseOK, str.tostring(nextBase))
+    cell(3, "Élastique au repos", restCore and aboveMM, str.tostring(math.sum(inside, restWin)) + "/" + str.tostring(restWin))
+    cell(4, "Écart MM50", stretch <= maxStretch and stretch >= 0, str.tostring(stretch, "#.#") + " %")
+    cell(5, "Résistance", resOK and resNear, str.tostring(touches) + " contacts")
+    cell(6, "Bougie cadeau", gift, str.tostring(rng / nz(avgRng, rng), "#.##") + " × moy.")
+    cell(7, "Résultats", not earnSoon, earnSoon ? "Proches" : "OK")
+    cell(8, "Statut", statut >= 3, statut == 4 ? "Déclenché" : statut == 3 ? "Ordre prêt" : statut == 2 ? "Surveiller" : statut == 1 ? "Repos" : "Rien")
+
+// ═════════════ Colonnes pour le Pine Screener ═════════════
+plot(statut, "Statut (0-4)", display=display.data_window)
+plot(setup ? 1 : 0, "Setup cadeau", display=display.data_window)
+plot(triggered ? 1 : 0, "Déclenché", display=display.data_window)
+plot(rest ? 1 : 0, "Repos", display=display.data_window)
+plot(phaseOK ? 1 : 0, "Phase OK", display=display.data_window)
+plot(nextBase, "Base visée", display=display.data_window)
+plot(touches, "Contacts résistance", display=display.data_window)
+plot(stretch, "Écart MM50 %", display=display.data_window)
+plot((res / close - 1) * 100, "Distance résistance %", display=display.data_window)
+plot(mktState, "Météo (0-2)", display=display.data_window)
+plot(qty, "Quantité", display=display.data_window)
+
+// ═════════════ Alertes ═════════════
+alertcondition(setup, "Bougie cadeau", "Biarritz : bougie cadeau sur {{ticker}} – achat > {{high}}, stop < {{low}}")
+alertcondition(triggered, "Ordre déclenché", "Biarritz : {{ticker}} a franchi le seuil d'achat")
+alertcondition(breakout and phaseOK, "Cassure de résistance", "Biarritz : {{ticker}} clôture au-dessus de la résistance")
+alertcondition(rest and resOK and phaseOK and not rest[1], "Élastique au repos", "Biarritz : {{ticker}} entre en surveillance")
+alertcondition(ta.crossunder(close, mmLong), "Clôture sous MM200", "Biarritz : {{ticker}} clôture sous la MM200")
+
+// Alerte unique pour « Toute fonction alert() » (pratique sur une liste de surveillance)
+if setup
+    alert("Biarritz – bougie cadeau " + syminfo.ticker + " | achat > " + str.tostring(trigLvl, format.mintick) + " | stop < " + str.tostring(stopLvl, format.mintick) + " | quantité " + str.tostring(qty) + " | base " + str.tostring(nextBase), alert.freq_once_per_bar_close)
+if triggered
+    alert("Biarritz – ordre déclenché " + syminfo.ticker + " | entrée ≈ " + str.tostring(entryPx, format.mintick) + " | stop " + str.tostring(entrySl, format.mintick), alert.freq_once_per_bar_close)
